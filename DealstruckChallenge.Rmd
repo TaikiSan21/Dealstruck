@@ -1,0 +1,179 @@
+---
+title: "Dealstruck Challenge"
+author: "Taiki Sakai"
+date: "March 17, 2016"
+output: 
+   pdf_document:
+      fig_caption: true
+graphics: yes
+
+---
+
+## Data Exploration, Cleaning, and Transformation
+
+The first step in any modeling project is acquiring and cleaning your data,
+otherwise you will suffer from garbage-in garbage-out. The most important steps
+were converting percentages that were stored as strings to numeric values, converting
+FICO scores from integers to named ranges (Good, Very Good, etc.), dealing with NA
+values in the data, and removing variables with too many factors (since our data
+contains only ~500 instances of delinquent loans, factors with 50+ levels are not
+going to be useful). I also removed some variables that were highly correlated with
+each other (> 0.9). 
+
+```{r, echo=FALSE, results='hide', message=FALSE}
+library('dplyr')
+library('randomForest')
+library('ggplot2')
+library('glmnet')
+library('caret')
+library('gridExtra')
+loanData <- read.csv('LC_biz_all.csv')
+```
+
+```{r, echo=FALSE, cache=TRUE}
+summary(loanData$loan_status)
+loanData <- read.csv('cleanedData.csv')
+```
+
+Looking at the classes we have, we see that there are very few 'Bad' classes so
+we will combine our classes into 'Current' and 'Delinquent' for our analysis.
+In Grace Period loans are removed from our data since they are neither good nor bad.
+Full details of all data processing can be found in the comments of the included code.
+
+We can also look at some plots of our data to get a sense of how some variables relate
+to the loan status.
+
+```{r, fig.align='center', fig.height=4, fig.width=9, echo=FALSE, message=FALSE}
+loanData$fico_range_low <- factor(loanData$fico_range_low, levels = c('Poor', 'Fair', 'Good', 'Very Good', 'Excellent'))
+fico <- ggplot(data = loanData, aes(x=fico_range_low, colour=loan_status)) +
+      geom_bar()
+loan <- ggplot(data = loanData, aes(x=loan_amnt, colour=loan_status)) +
+      geom_bar()
+grid.arrange(fico, loan, ncol=2)
+```
+
+From these we can see that lower FICOs and higher loan amounts might have higher delinquency
+rates, as we might expect.
+
+## Model Building
+
+The two options I am considering are a logistic regression model and a random
+forest model. Both are good for classification, which is what we want to do.
+I will first try a logistic regression model, as the results are generally easier
+to interpret. Since we are interested in what factors might effect delinquency, 
+and not just predictive accuracy, I believe ease of interpretation is important.
+
+We begin by splitting our data into a test and training set using an 80/20 split,
+then we will fit our model to the training dataset. We have 35 possible predictor
+variables, so we will use Lasso regression to try limit the number that the model uses.
+The data must be standardized for the Lasso, and we will also use 10-fold cross
+validation to find the parameter lambda that has the smallest prediction error.
+
+```{r, echo=FALSE}
+set.seed(1121) # Set seed so results can be reproduced
+trainIndex <- createDataPartition(loanData$loan_status, p = .8, list=FALSE)
+train <- loanData[trainIndex,]
+test <- loanData[-trainIndex,]
+myformula <- as.formula(paste('~ ', paste(names(select(train, -c(loan_status, id))), collapse='+')))
+trainx <- model.matrix(myformula,select(train, -c(loan_status, id)))
+trainy <- train$loan_status
+testx <- model.matrix(myformula, select(test, -c(loan_status, id)))
+testy <- test$loan_status
+```
+
+```{r, echo=FALSE}
+logModel <- cv.glmnet(trainx, trainy, family='binomial', standardize=TRUE,
+                      nfolds=10, alpha=1, type.measure = 'class')
+```
+
+
+```{r, fig.align='center', fig.height=4, fig.width=4, echo=FALSE, fig.cap='Error With the Full Dataset'}
+baseError <- sum(trainy=='Delinquent')/length(trainy)
+plot(logModel)
+abline(h=baseError, lwd=3, col='blue')
+```
+
+The graph shows the misclassifcation error for various values of lambda
+chosen by cross validation. An error rate of around .1 might sound good, but
+further investigation reveals a problem. The blue line is the error rate if
+we just choose all loans to be 'Current', and this is indeed what the model is doing
+as we can see if we predict on our test set.
+
+```{r, echo=FALSE}
+preds <- predict(logModel, s='lambda.min', newx =testx, type='class')
+table(preds, testy)
+```
+
+This problem arises because approximately 90% of our data are 'Current' loans,
+and logistic regression models suffer when the proportion is not close to 50/50.
+The best approach would probably be to try and get more data for delinquent loans,
+but if that is not possible there is another approach we can try. We can use a random
+sample of our 'Current' loans that matches the number of 'Delinquent' loans in our
+dataset. Then we would have a 50/50 split, but this approach has its risks. You 
+could possibly be removing valuable information from the 'Current' portion of the data
+even if the sampling is truly random. We will try this approach and see how the results
+compare.
+
+```{r, echo=FALSE}
+set.seed(5432)
+downSampleCurrent <- sample_n( filter(train, loan_status=='Current'), 439)
+downTrain <- rbind(downSampleCurrent, filter(train, loan_status=='Delinquent'))
+downTrainx <- model.matrix(myformula, select(downTrain, -c(loan_status, id)))
+downTrainy <- downTrain$loan_status
+logModelDown <- cv.glmnet(downTrainx, downTrainy, family='binomial', standardize=TRUE, nfolds=10, alpha=1, type.measure='class')
+```
+
+```{r, fig.align='center', fig.height=4, fig.width=4, echo=FALSE, fig.cap='Error With the Downsampled Data'}
+plot(logModelDown)
+```
+
+The error rate in this case is lower than our base error rate of .5, although ~.33 is
+a bit high. Predicting on the test set shows that our prediction error is similar
+for both Current and Delinquent loans at around .33. Although this prediction 
+error is on the high side, this model should be a more accurate representation
+of what actually affects loan delinquency.
+
+```{r, echo=FALSE}
+predsDown <- predict(logModelDown, s='lambda.min', newx=testx, type='class')
+table(predsDown[,], testy)
+```
+
+The coefficients of this model are included in the appendix. Coeffcients with a
+positive sign will increase the chance of delinquency, while negative coefficients
+will decrease it. Only the non-zero coefficients (as chosen by the cross validated
+Lasso) are shown.
+
+## Conclusions and Future Considerations
+
+There are clearly some issues with trying to use the entire given data set. The
+best approach would be to try and gather more data on delinquent loans so that 
+the proportions are closer to 50/50. Downsampling is far from a perfect strategy,
+so to ensure accurate results more data is the best course. I found more loan data
+from previous years on the Lending Club website that could be used. They also
+have data on declined loans - it would be interesting to try and compare their
+attributes to loans that ended up becoming delinquent.
+
+As I mentioned in the model building section, I also considered using a 
+random forest model. I actually quickly tried a random forest model and 
+it produced very similar results on both the full and downsampled dataset.
+The two models generated the same predictions on 85% of the test samples so
+it is possible that an ensemble method could produce better results.
+
+Other future work that could be done is trying to use the residuals from
+the logistic regression to try and determine if any variable transformations 
+could be appropriate. We could also try using ridge or elastic net regression
+by adjusting the alpha parameter in glmnet, but I feel that gathering
+more data on delinquent loans would be the most productive thing to do.
+
+## Appendix
+
+Coefficients from the Logistic Regression model fitted to the downsampled data.
+```{r, echo=FALSE}
+coefs <- coef(logModelDown, s='lambda.min')
+coefNames <- data.frame(names = row.names(coefs), coef = 1:length(coefs))
+for(i in 1:42) {
+      coefNames[i,2] <- coefs[i]} 
+coefNames[coefNames$coef != 0,]
+```
+
+
